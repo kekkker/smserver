@@ -1,28 +1,48 @@
-# Uncomment the next line to define a global platform for your project
-# platform :ios, '13.0'
+# Global platform (important)
+platform :ios, '16.0'
+
+inhibit_all_warnings!
 
 target 'SMServer' do
-  platform :ios, '10.0'
-
-  # Comment the next line if you don't want to use dynamic frameworks
   use_frameworks!
 
-  # Pods for SMServer
   pod 'Telegraph'
-  # I'm sorry that it's a local repo; this podspec is also available online for you to download:
-  # https://raw.githubusercontent.com/iandwelker/Criollo/master/Criollo.podspec
   pod 'Criollo', :podspec => './Criollo.podspec'
-
   pod 'Starscream', '~> 4.0.0'
-
 end
 
 target 'SMServer_Mac' do
   platform :osx, '10.13'
-
   use_frameworks!
 
   pod 'Telegraph'
   pod 'Criollo', :podspec => './Criollo.podspec'
+end
 
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+
+      # --- Normalize OTHER_LDFLAGS to Array ---
+      flags = config.build_settings['OTHER_LDFLAGS']
+      flags = flags.split(' ') if flags.is_a?(String)
+      flags ||= ['$(inherited)']
+
+      # --- Remove ARC Lite / legacy flags ---
+      flags -= ['-larclite', '-lobjc']
+
+      config.build_settings['OTHER_LDFLAGS'] = flags
+
+      # --- Force modern iOS ---
+      if target.platform_name == :ios
+        config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '16.0'
+      end
+
+      # --- Keep Swift 5 ---
+      config.build_settings['SWIFT_VERSION'] = '5.0'
+
+      # --- No hardened runtime ---
+      config.build_settings['ENABLE_HARDENED_RUNTIME'] = 'NO'
+    end
+  end
 end

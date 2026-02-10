@@ -1,0 +1,436 @@
+name: Build SMServer
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+
+    - name: Install dependencies
+      run: |
+        sudo gem install cocoapods xcpretty
+        brew install dpkg ldid
+
+    - name: Install Theos
+      run: |
+        echo "=== Installing Theos ==="
+        git clone --recursive https://github.com/theos/theos.git $HOME/theos
+        export THEOS=$HOME/theos
+        echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+    - name: Configure Theos for GitHub Actions
+      run: |
+        export THEOS=$HOME/theos
+        SDKPATH=$(xcrun --sdk iphoneos --show-sdk-path)
+        SDKVERSION=$(xcrun --sdk iphoneos --show-sdk-version)
+
+        echo "=== Found SDK ==="
+        echo "Path: $SDKPATH"
+        echo "Version: $SDKVERSION"
+
+        echo "SDKROOT=$SDKPATH" >> $GITHUB_ENV
+        echo "SYSROOT=$SDKPATH" >> $GITHUB_ENV
+        echo "THEOS_SDKS_PATH=$(dirname $SDKPATH)" >> $GITHUB_ENV
+
+    - name: Generate identity
+      run: |
+        openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem \
+          -days 9999 -nodes -subj "/C=ZZ/ST=./L=./O=./CN=smserver.com"
+        openssl x509 -outform der -in cert.pem -out src/SMServer/cert.der
+        CERT_PASS="changeme"
+        openssl pkcs12 -export -out src/SMServer/identity.pfx \
+          -inkey key.pem -in cert.pem -password pass:$CERT_PASS
+
+        cat > src/SMServer/shared/IdentityPass.swift <<EOF
+        class PKCS12Identity {
+            static let pass: String = "$CERT_PASS"
+        }
+        EOF
+        rm key.pem cert.pem
+
+    - name: Clone and build MRYIPC (rootless fork)
+      run: |
+        echo "=== Cloning MRYIPC rootless fork ==="
+        git clone https://github.com/Baw-Appie/MRYIPC.git
+        cd MRYIPC
+
+        export THEOS=$HOME/theos
+        export SDKVERSION=$(xcrun --sdk iphoneos --show-sdk-version)
+        export SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+
+        echo "=== Checking rootless fork differences ==="
+        cat Makefile | head -10
+
+        echo "=== Building main MRYIPC library ==="
+        make clean
+        make FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ADDITIONAL_CFLAGS="-Wno-unused-but-set-variable"
+
+        echo "=== Building mrybootstrap tweak ==="
+        cd mrybootstrap
+        make clean
+        make FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless ADDITIONAL_CFLAGS="-Wno-unused-but-set-variable"
+        cd ..
+
+        echo "=== Copying MRYIPC files to staging ==="
+        mkdir -p ../mryipc-files
+        cp usr/lib/libmryipc.dylib ../mryipc-files/
+        cp mrybootstrap/.theos/obj/mrybootstrap.dylib ../mryipc-files/
+        cp mrybootstrap/mrybootstrap.plist ../mryipc-files/
+
+        echo "=== Rootless MRYIPC files ready ==="
+        ls -la ../mryipc-files/
+        file ../mryipc-files/libmryipc.dylib
+        file ../mryipc-files/mrybootstrap.dylib
+
+    - name: Replace old libmryipc with new rootless one
+      run: |
+        echo "=== Original libmryipc info ==="
+        file src/SMServer/libmryipc.dylib
+        ls -lh src/SMServer/libmryipc.dylib
+
+        echo "=== New rootless MRYIPC library info ==="
+        file mryipc-files/libmryipc.dylib
+        ls -lh mryipc-files/libmryipc.dylib
+        lipo -info mryipc-files/libmryipc.dylib
+
+        echo "=== Extracting arm64 slice ==="
+        lipo mryipc-files/libmryipc.dylib -thin arm64 -output mryipc-files/libmryipc_arm64.dylib || {
+          echo "lipo failed, checking if already arm64-only..."
+          cp mryipc-files/libmryipc.dylib mryipc-files/libmryipc_arm64.dylib
+        }
+
+        file mryipc-files/libmryipc_arm64.dylib
+
+        echo "=== Replacing in source ==="
+        cp mryipc-files/libmryipc_arm64.dylib src/SMServer/libmryipc.dylib
+
+        cd src/SMServer
+        install_name_tool -id "@rpath/libmryipc.dylib" libmryipc.dylib
+        ldid -S libmryipc.dylib
+
+        echo "=== Replacement complete ==="
+        file libmryipc.dylib
+        ls -lh libmryipc.dylib
+        otool -L libmryipc.dylib | head -5
+
+    - name: Update deployment target
+      run: |
+        cd src
+        sed -i '' "s/platform :ios.*/platform :ios, '16.0'/" Podfile || true
+        sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*/IPHONEOS_DEPLOYMENT_TARGET = 16.0/g' \
+          SMServer.xcodeproj/project.pbxproj
+
+    - name: Install CocoaPods
+      run: |
+        cd src
+        pod deintegrate || true
+        pod install --repo-update
+
+    - name: Build archive
+      run: |
+        cd src
+        xcodebuild clean \
+          -workspace SMServer.xcworkspace \
+          -scheme SMServer
+
+        xcodebuild archive \
+          -workspace SMServer.xcworkspace \
+          -scheme SMServer \
+          -configuration Release \
+          -archivePath ../build/SMServer.xcarchive \
+          -sdk iphoneos \
+          -destination 'generic/platform=iOS' \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          ENABLE_BITCODE=NO \
+          | xcpretty
+
+    - name: Fix rpath in archive
+      run: |
+        APP=build/SMServer.xcarchive/Products/Applications/SMServer.app/SMServer
+        install_name_tool -add_rpath "@executable_path/Frameworks" "$APP" || true
+
+    - name: Create IPA
+      run: |
+        APP=build/SMServer.xcarchive/Products/Applications/SMServer.app
+
+        mkdir -p package/Payload
+        cp -r "$APP" package/Payload/
+
+        cat > package/entitlements.plist << 'EOF'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+         "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>application-identifier</key>
+          <string>com.ianwelker.smserver</string>
+          <key>get-task-allow</key>
+          <true/>
+        </dict>
+        </plist>
+        EOF
+
+        echo "Signing main binary"
+        ldid -Spackage/entitlements.plist package/Payload/SMServer.app/SMServer
+
+        if [ -d package/Payload/SMServer.app/Frameworks ]; then
+          for item in package/Payload/SMServer.app/Frameworks/*; do
+            if [ -d "$item" ] && [[ "$item" == *.framework ]]; then
+              binary=$(find "$item" -type f -perm +111 -not -path "*/.*" | head -1)
+              if [ -n "$binary" ]; then
+                ldid -S "$binary"
+              fi
+            elif [ -f "$item" ] && [[ "$item" == *.dylib ]]; then
+              ldid -S "$item"
+            fi
+          done
+        fi
+
+        cd package
+        zip -qry SMServer_iOS16.ipa Payload
+        cd ..
+
+    - name: Setup MRYIPC headers for libsmserver
+      run: |
+        echo "=== Setting up rootless MRYIPC headers ==="
+        mkdir -p $HOME/theos/include
+        cp MRYIPC/*.h $HOME/theos/include/
+
+        echo "=== MRYIPC headers installed ==="
+        ls -la $HOME/theos/include/
+
+    - name: Fix libsmserver code for modern SDK
+      run: |
+        cd libsmserver
+
+        echo "=== Patching Tweak.xm ==="
+        sed -i '' 's/limit:nil/limit:0/g' Tweak.xm
+
+        echo "=== Fixing Makefile for dynamic MRYIPC ==="
+        sed -i '' '/libsmserver_LIBRARIES = mryipc/d' Makefile
+        sed -i '' 's/libsmserver_CFLAGS = -fobjc-arc -I$(THEOS)\/include/libsmserver_CFLAGS = -fobjc-arc -I$(THEOS)\/include\nlibsmserver_LDFLAGS = -undefined dynamic_lookup/' Makefile
+
+        echo "=== Patched Makefile ==="
+        grep -A2 "libsmserver_CFLAGS" Makefile
+        grep "LDFLAGS" Makefile || echo "No LDFLAGS"
+
+    - name: Build libsmserver tweak
+      run: |
+        echo "=== Building libsmserver for rootless ==="
+        export THEOS=$HOME/theos
+        export THEOS_DEVICE_IP=localhost
+        export THEOS_DEVICE_PORT=2222
+        export SDKVERSION=$(xcrun --sdk iphoneos --show-sdk-version)
+        export SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+
+        cd libsmserver
+
+        echo "=== Original Makefile ==="
+        head -15 Makefile
+
+        sed -i '' 's/ARCHS = arm64 arm64e/ARCHS = arm64/' Makefile
+        sed -i '' 's/TARGET := iphone:clang:12.2/TARGET = iphone:clang:latest:16.0/' Makefile
+        sed -i '' '/^PREFIX=/d' Makefile
+        sed -i '' '1s/^/THEOS_PACKAGE_SCHEME = rootless\n/' Makefile
+        sed -i '' 's/libsmserver_CFLAGS = -fobjc-arc/libsmserver_CFLAGS = -fobjc-arc -I$(THEOS)\/include/' Makefile
+        sed -i '' '/libsmserver_LIBRARIES = mryipc/d' Makefile
+        echo "libsmserver_LDFLAGS = -undefined dynamic_lookup" >> Makefile
+
+        echo "=== Fixed Makefile ==="
+        head -20 Makefile
+        echo "..."
+        tail -5 Makefile
+
+        echo "=== Checking for MRYIPC headers ==="
+        ls -la $HOME/theos/include/MRYIPC* || echo "Headers not found"
+
+        make clean || true
+
+        make package FINALPACKAGE=1 \
+          THEOS_PACKAGE_SCHEME=rootless \
+          SYSROOT="$SYSROOT" \
+          ADDITIONAL_CFLAGS="-I$HOME/theos/include" \
+          2>&1 || {
+            echo "=== Package build failed, trying simple build ==="
+            make FINALPACKAGE=1 || true
+          }
+
+        echo "=== Build output ==="
+        find . \( -name "*.dylib" -o -name "*.plist" \) | head -20
+        ls -lh lib/ 2>/dev/null || echo "No lib directory"
+        ls -lh obj/ 2>/dev/null || echo "No obj directory"
+        ls -lh .theos/obj/ 2>/dev/null || echo "No .theos/obj directory"
+
+    - name: Build rootless DEB with system libmryipc
+      run: |
+        APP=build/SMServer.xcarchive/Products/Applications/SMServer.app
+        DEB=package/deb
+        ENT=package/entitlements.plist
+
+        echo "=== Preparing DEB structure ==="
+        rm -rf "$DEB"
+        mkdir -p "$DEB/DEBIAN"
+        mkdir -p "$DEB/var/jb/Applications"
+        mkdir -p "$DEB/var/jb/usr/lib"
+        mkdir -p "$DEB/var/jb/usr/lib/TweakInject"
+
+        echo "=== Copying app ==="
+        cp -R "$APP" "$DEB/var/jb/Applications/"
+
+        echo "=== Removing bundled libmryipc (will use system one) ==="
+        rm -f "$DEB/var/jb/Applications/SMServer.app/Frameworks/libmryipc.dylib"
+
+        echo "=== Copying rootless MRYIPC library to system ==="
+        cp mryipc-files/libmryipc.dylib "$DEB/var/jb/usr/lib/"
+
+        echo "=== Copying mrybootstrap tweak ==="
+        cp mryipc-files/mrybootstrap.dylib "$DEB/var/jb/usr/lib/TweakInject/"
+        cp mryipc-files/mrybootstrap.plist "$DEB/var/jb/usr/lib/TweakInject/"
+
+        BIN="$DEB/var/jb/Applications/SMServer.app/SMServer"
+        FRAMEWORKS="$DEB/var/jb/Applications/SMServer.app/Frameworks"
+
+        if [ ! -f "$BIN" ]; then
+          echo "ERROR: SMServer binary missing"
+          exit 1
+        fi
+
+        echo "=== Fixing rpath ==="
+        install_name_tool -add_rpath "@executable_path/Frameworks" "$BIN" 2>/dev/null || true
+
+        echo "=== Changing libmryipc to use system library ==="
+        install_name_tool -change "@rpath/libmryipc.dylib" "/var/jb/usr/lib/libmryipc.dylib" "$BIN"
+
+        echo "=== Signing ALL frameworks ==="
+        if [ -d "$FRAMEWORKS" ]; then
+          for item in "$FRAMEWORKS"/*; do
+            if [ -d "$item" ] && [[ "$item" == *.framework ]]; then
+              binary=$(find "$item" -type f -perm +111 -not -path "*/.*" | head -1)
+              if [ -n "$binary" ]; then
+                echo "  Signing $(basename $item)"
+                ldid -S "$binary"
+              fi
+            elif [ -f "$item" ] && [[ "$item" == *.dylib ]]; then
+              echo "  Signing $(basename $item)"
+              ldid -S "$item"
+            fi
+          done
+        fi
+
+        echo "=== Signing system libmryipc ==="
+        ldid -S "$DEB/var/jb/usr/lib/libmryipc.dylib"
+
+        echo "=== Signing main binary ==="
+        ldid -S"$ENT" "$BIN"
+
+        echo "=== Looking for libsmserver files ==="
+        find libsmserver \( -name "*.dylib" -o -name "*.plist" \) 2>/dev/null | head -20 || echo "No files found"
+
+        echo "=== Copying libsmserver tweak files ==="
+        TWEAK_FOUND=false
+
+        for dylib_path in \
+          "libsmserver/lib/libsmserver.dylib" \
+          "libsmserver/obj/libsmserver.dylib" \
+          "libsmserver/.theos/obj/libsmserver.dylib" \
+          "libsmserver/.theos/obj/debug/libsmserver.dylib" \
+          "libsmserver/.theos/obj/debug/arm64/libsmserver.dylib"; do
+
+          if [ -f "$dylib_path" ]; then
+            echo "Found libsmserver.dylib at: $dylib_path"
+            cp "$dylib_path" "$DEB/var/jb/usr/lib/TweakInject/"
+            ldid -S "$DEB/var/jb/usr/lib/TweakInject/libsmserver.dylib"
+            TWEAK_FOUND=true
+            break
+          fi
+        done
+
+        if [ "$TWEAK_FOUND" = false ]; then
+          echo "================================================================"
+          echo "ERROR: libsmserver.dylib was NOT built successfully!"
+          echo "================================================================"
+        fi
+
+        if [ -f "libsmserver/libsmserver.plist" ]; then
+          cp libsmserver/libsmserver.plist "$DEB/var/jb/usr/lib/TweakInject/"
+        else
+          cat > "$DEB/var/jb/usr/lib/TweakInject/libsmserver.plist" << 'PLISTEOF'
+        {
+            Filter = {
+                Bundles = (
+                    "com.apple.MobileSMS"
+                );
+            };
+        }
+        PLISTEOF
+        fi
+
+        echo "=== DEB tweak files ==="
+        ls -la "$DEB/var/jb/usr/lib/TweakInject/"
+
+        echo "=== System library ==="
+        ls -lh "$DEB/var/jb/usr/lib/libmryipc.dylib"
+
+        cat > "$DEB/DEBIAN/control" << 'CONTROLEOF'
+        Package: com.ianwelker.smserver
+        Name: SMServer
+        Version: 0.9.7-rootless
+        Architecture: iphoneos-arm64
+        Description: Access iMessage remotely via web interface (with rootless MRYIPC)
+        Depends: firmware (>= 16.0), mobilesubstrate
+        Maintainer: Ian Welker
+        Author: Ian Welker
+        Section: Tweaks
+        CONTROLEOF
+
+        cat > "$DEB/DEBIAN/postinst" << 'POSTINSTEOF'
+        #!/bin/bash
+        echo "SMServer: Registering app..."
+        uicache -p /var/jb/Applications/SMServer.app || true
+
+        if [ -f /var/jb/usr/lib/TweakInject/libsmserver.dylib ]; then
+          echo "SMServer: Tweaks installed with rootless MRYIPC"
+          killall -9 MobileSMS 2>/dev/null || true
+          killall -9 MobileGestaltHelper 2>/dev/null || true
+          echo "RESPRING REQUIRED. Open Messages, then SMServer."
+        else
+          echo "WARNING: Tweak not installed."
+        fi
+
+        echo "SMServer v0.9.7-rootless installed"
+        exit 0
+        POSTINSTEOF
+
+        chmod 755 "$DEB/DEBIAN/postinst"
+
+        echo "=== Building DEB ==="
+        dpkg -b "$DEB" "package/SMServer_0.9.7-rootless.deb"
+
+        echo "=== DEB created ==="
+        ls -lh package/*.deb
+
+        echo "=== DEB contents ==="
+        dpkg-deb --contents "package/SMServer_0.9.7-rootless.deb" | grep -E "(libsmserver|mrybootstrap|libmryipc|SMServer.app)" | head -40
+
+    - name: Upload DEB artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: SMServer-DEB
+        path: package/*.deb
